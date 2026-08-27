@@ -13,11 +13,7 @@ import re
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GdkPixbuf, Pango, GLib
 from ks_includes.screen_panel import ScreenPanel
-from ks_includes.KlippyRest import KlippyRest
 from ks_includes.widgets.autogrid import AutoGrid
-from ks_includes.widgets.keypad import Keypad
-from ks_includes.KlippyGtk import find_widget
-from panels import extrude
 from datetime import datetime
 
 UNLOADED = "unloaded"
@@ -205,13 +201,11 @@ class AFClane:
 
 
 class Panel(ScreenPanel):
-    apiClient: KlippyRest
     lane_widgets: dict
 
     def __init__(self, screen, title):
         title = title or ("AFC Status")
         super().__init__(screen, title)
-        self.apiClient = getattr(screen, "apiclient", None) or getattr(screen, "restApi", None)
         self.lane_widgets = {}
         AFClane.theme_path = screen.theme
         logging.info(f"Theme path: {AFClane.theme_path}")
@@ -226,17 +220,10 @@ class Panel(ScreenPanel):
 
         self._pending_lane_grid_updates = {}
 
-        result = self.apiClient.post_request("printer/afc/status", json={})
-        if not isinstance(result, dict):
-            logging.error(f"API call failed or returned invalid data: {result}")
-            # Optionally show a user-friendly error or retry
-            # Remove this panel and go back to the previous one
-            return
-
-        afc_data = result.get('result', {}).get('status:', {}).get('AFC', {})
-        logging.info(f"AFC Data Extracted: {afc_data}")
-
-        self.reset_ui()
+        # printer.afc.status is answered asynchronously over the websocket, so the panel
+        # starts on a placeholder page and is built once the reply arrives.
+        self.ready = False
+        self.status_pending = False
 
         self.afc_units = []
         self.afc_unit_names = []
@@ -256,19 +243,80 @@ class Panel(ScreenPanel):
         self.selected_color = "#000000"
         self.selected_type = None
         self.selected_weight = 0
-        self.sensor_poll_id = None  # Store the timeout ID so you can stop it if needed
-        self.start_sensor_polling()  # Start periodic sensor polling
         self.virtual_bypass = False
         self.led_state = False  # Track the AFC LED state
 
-        self.data = self.apiClient.post_request("printer/objects/list", json={})
-        sensor_data = self.data.get('result', {}).get('objects', {})
         self.filament_sensors = [
-            name for name in sensor_data
+            name for name in self._printer.get_filament_sensors()
             if name.startswith("filament_switch_sensor")
         ]
 
         self.sensors = self.fetch_sensor_data()
+
+        self.reset_ui()
+        if not self.request_afc_status(self.load_afc_status):
+            self.report_afc_failure("websocket is not connected")
+
+    def request_afc_status(self, callback):
+        """
+        Ask Moonraker for the AFC status over the websocket.
+        :return: False if the request could not be sent.
+        """
+        return self._screen._ws.send_method("printer.afc.status", {}, callback)
+
+    @staticmethod
+    def extract_afc_data(response):
+        """
+        Pull the AFC payload out of a printer.afc.status reply.
+        :return: The AFC dictionary, or None if the request itself failed.
+        """
+        if not isinstance(response, dict) or "error" in response:
+            return None
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return None
+        return result.get("status:", {}).get("AFC", {})
+
+    def report_afc_failure(self, response):
+        """
+        Tell the user the panel is unusable and drop back to the previous panel.
+        """
+        logging.error(f"printer.afc.status failed or returned invalid data: {response}")
+        self.update_info = False
+        self._screen.show_popup_message(_("AFC panel could not be loaded.\nCheck your printer configuration."))
+        cur_panels = self._screen._cur_panels
+        if cur_panels and self._screen.panels.get(cur_panels[-1]) is self:
+            self._screen._remove_current_panel()
+            self._screen._menu_go_back()  # Go back to main menu or previous panel
+
+    def load_afc_status(self, response, method, params):
+        """
+        Build the panel from the first printer.afc.status reply.
+        """
+        self.status_pending = False
+        afc_data = self.extract_afc_data(response)
+        if afc_data is None:
+            self.report_afc_failure(response)
+            return
+        logging.info(f"AFC Data Extracted: {afc_data}")
+
+        self.build_units(afc_data)
+        self.init_layout()
+        self.sensor_layout()
+        self.create_spool_layout()
+
+        self.ready = True
+        self.screen_stack.set_visible_child_name("main_grid")
+        self.enable_buttons(self._printer.state in ("ready", "paused"))
+
+    def build_units(self, afc_data):
+        """
+        Turn the AFC status payload into unit and lane objects.
+        """
+        self.afc_units = []
+        self.afc_unit_names = []
+        self.afc_lane_data = []
+        self.afc_lanes = []
 
         for unit_name, unit_data in afc_data.items():
             if unit_name == "system":
@@ -317,10 +365,6 @@ class Panel(ScreenPanel):
         logging.info(f"Unit names: {self.afc_unit_names}")
         logging.info(f"lane names: {self.afc_lanes}")
 
-        self.init_layout()
-        self.sensor_layout()
-        self.create_spool_layout()
-    
     def get_afc_lanes(self):
         """
         Return the list of AFC lanes.
@@ -331,24 +375,17 @@ class Panel(ScreenPanel):
         """
         Process the update from the printer.
         """
-        if self.update_info == False:
+        if self.update_info == False or not self.ready:
             return
 
-        api_data = self.apiClient.post_request("printer/afc/status", json={})
-        if not isinstance(api_data, dict):
-            logging.error(f"API call failed or returned invalid data: {api_data}")
-            self.update_info = False
-            self._screen.show_popup_message(_("AFC panel could not be loaded.\nCheck your printer configuration."))
-            self._screen._remove_current_panel()
-            self._screen._menu_go_back()  # Go back to main menu or previous panel
-            return
+        # Only one AFC status request in flight: updates arrive faster than Moonraker replies.
+        if not self.status_pending:
+            self.status_pending = True
+            if not self.request_afc_status(self.refresh_afc_status):
+                self.status_pending = False
 
-        afc_data = api_data.get('result', {}).get('status:', {}).get('AFC', {})
-        if afc_data:
-            self.update_ui(afc_data)
-        else:
-            logging.error("No AFC data found in the API response.")
-            self.update_info = False
+        if action == "notify_status_update":
+            self.update_sensors(self.fetch_sensor_data())
             return
 
         if action == "notify_gcode_response":
@@ -358,9 +395,23 @@ class Panel(ScreenPanel):
                 self.enable_buttons(False)
             elif "action:resumed" in data:
                 self.enable_buttons(False)
+
+    def refresh_afc_status(self, response, method, params):
+        """
+        Apply a printer.afc.status reply to the running panel.
+        """
+        self.status_pending = False
+        if not self.update_info or not self.ready:
             return
-        if action != "notify_status_update":
+        afc_data = self.extract_afc_data(response)
+        if afc_data is None:
+            self.report_afc_failure(response)
             return
+        if not afc_data:
+            logging.error("No AFC data found in the API response.")
+            self.update_info = False
+            return
+        self.update_ui(afc_data)
 
     def enable_buttons(self, enable):
         if not hasattr(self, "action_buttons") or not self.action_buttons:
@@ -370,47 +421,13 @@ class Panel(ScreenPanel):
 
     def activate(self):
         self.update_info = True
-        self.start_sensor_polling()  # Start polling when activated
-        if hasattr(self, "screen_stack"):
+        if self.ready:
             self.screen_stack.set_visible_child_name("main_grid")
         self.enable_buttons(self._printer.state in ("ready", "paused"))
 
     def deactivate(self):
         self.update_info = False
-        self.stop_sensor_polling()  # Stop polling when deactivated
         self.enable_buttons(False)
-
-    def start_sensor_polling(self):
-        """
-        Start polling the sensor data every 10 seconds.
-        Delayed start to allow the UI to initialize properly.
-        """
-        if self.sensor_poll_id is not None:
-            GLib.source_remove(self.sensor_poll_id)
-            self.sensor_poll_id = None
-        # Only start polling if update_info is True
-        if self.update_info:
-            self.sensor_poll_id = GLib.timeout_add_seconds(10, self.poll_sensors)
-
-    def stop_sensor_polling(self):
-        """
-        Stop the sensor polling timer.
-        """
-        if self.sensor_poll_id is not None:
-            GLib.source_remove(self.sensor_poll_id)
-            self.sensor_poll_id = None
-
-    def poll_sensors(self):
-        """
-        Fetch and update sensor data. Return True to keep polling.
-        """
-        if not self.update_info:
-            return False  # Stop polling if not active
-        if not self.filament_sensors:
-            return True  # Keep polling, but nothing to do
-        sensor_data = self.fetch_sensor_data()
-        self.update_sensors(sensor_data)
-        return True  # Continue polling
 
     def process_system_data(self, system_data):
         extruders = {name: Extruder(**data) for name, data in system_data.get("extruders", {}).items()}
@@ -448,10 +465,20 @@ class Panel(ScreenPanel):
         self.selector_grid = Gtk.Grid(column_homogeneous=True)
         self.selector_grid.set_vexpand(True)
 
+        # Shown until the first printer.afc.status reply builds the real layout
+        self.loading_grid = Gtk.Grid(column_homogeneous=True)
+        self.loading_grid.set_vexpand(True)
+        loading_label = Gtk.Label(label=_("Loading AFC status..."))
+        loading_label.set_hexpand(True)
+        loading_label.set_vexpand(True)
+        self.loading_grid.attach(loading_label, 0, 0, 1, 1)
+
+        self.screen_stack.add_named(self.loading_grid, "loading_grid")
         self.screen_stack.add_named(self.grid, "main_grid")
         self.screen_stack.add_named(self.sensor_grid, "sensor_grid")
         self.screen_stack.add_named(self.selector_grid, "selector_grid")
-        
+        self.screen_stack.set_visible_child_name("loading_grid")
+
         self.content.add(self.screen_stack)
 
     def remove_all_classes(self, widget):
@@ -1003,12 +1030,14 @@ class Panel(ScreenPanel):
             style.add_class("vb_active")
             logging.info("AFC Virtual Bypass enabled")
             self._screen.show_popup_message(_("Virtual Bypass enabled"), 1)
-            self._screen._ws.klippy.gcode_script("SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE=1")
+            self._screen._send_action(button, "printer.gcode.script",
+                                      {"script": "SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE=1"})
         else:
             style.add_class("vb_inactive")
             logging.info("AFC Virtual Bypass disabled")
             self._screen.show_popup_message(_("Virtual Bypass Disabled"), 1)
-            self._screen._ws.klippy.gcode_script("SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE=0")
+            self._screen._send_action(button, "printer.gcode.script",
+                                      {"script": "SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE=0"})
 
     def update_virtual_bypass_toggle(self, new_status):
         """
@@ -2531,15 +2560,14 @@ class Panel(ScreenPanel):
 
     def fetch_sensor_data(self):
         """
-        Fetches the current filament sensor data from the printer API.
+        Reads the filament sensor states out of the printer data that KlipperScreen
+        already subscribes to.
         :return: Dictionary containing the status of the sensors.
         """
-        # Here we send the request and parse the result into a dictionary
-        logging.info("Fetching filament sensor data from the printer API")
-        sensor_query = "&".join(self.filament_sensors)
-        result = self.apiClient.send_request(f"printer/objects/query?{sensor_query}")
-        sensor_data = result.get("status", {})
-        return sensor_data
+        return {
+            name: {"filament_detected": self._printer.get_stat(name, "filament_detected")}
+            for name in self.filament_sensors
+        }
 
     def update_sensors(self, data):
         """
