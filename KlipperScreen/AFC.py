@@ -246,14 +246,46 @@ class Panel(ScreenPanel):
         self.virtual_bypass = False
         self.led_state = False  # Track the AFC LED state
 
-        self.filament_sensors = [
-            name for name in self._printer.get_filament_sensors()
-            if name.startswith("filament_switch_sensor")
-        ]
-
-        self.sensors = self.fetch_sensor_data()
+        # AFC registers virtual_bypass and most of its lane/hub switches at
+        # runtime, so they never appear in configfile.config and
+        # _printer.get_filament_sensors() cannot see them. Ask Moonraker for the
+        # live object list, and poll those objects for their state, since
+        # KlipperScreen only subscribes to the sensors it found in the config.
+        self.filament_sensors = []
+        self.sensors = {}
+        self.sensors_pending = False
 
         self.reset_ui()
+        if not self.request_object_list(self.load_object_list):
+            self.report_afc_failure("websocket is not connected")
+
+    def request_object_list(self, callback):
+        """
+        Ask Moonraker which printer objects Klipper has loaded.
+        :return: False if the request could not be sent.
+        """
+        return self._screen._ws.send_method("printer.objects.list", {}, callback)
+
+    def load_object_list(self, response, method, params):
+        """
+        Record the filament sensors Klipper actually loaded, then request the AFC
+        status that builds the panel.
+        """
+        objects = []
+        if isinstance(response, dict):
+            objects = response.get("result", {}).get("objects", []) or []
+        self.filament_sensors = [
+            name for name in objects
+            if name.startswith("filament_switch_sensor")
+        ]
+        if not self.filament_sensors:
+            # Fall back to the config sections if the query failed.
+            self.filament_sensors = [
+                name for name in self._printer.get_filament_sensors()
+                if name.startswith("filament_switch_sensor")
+            ]
+        logging.info(f"Filament sensors: {self.filament_sensors}")
+
         if not self.request_afc_status(self.load_afc_status):
             self.report_afc_failure("websocket is not connected")
 
@@ -308,6 +340,7 @@ class Panel(ScreenPanel):
         self.ready = True
         self.screen_stack.set_visible_child_name("main_grid")
         self.enable_buttons(self._printer.state in ("ready", "paused"))
+        self.request_sensor_state()
 
     def build_units(self, afc_data):
         """
@@ -385,7 +418,7 @@ class Panel(ScreenPanel):
                 self.status_pending = False
 
         if action == "notify_status_update":
-            self.update_sensors(self.fetch_sensor_data())
+            self.request_sensor_state()
             return
 
         if action == "notify_gcode_response":
@@ -976,8 +1009,7 @@ class Panel(ScreenPanel):
         This button allows the user to enable or disable the virtual bypass feature.
         """
 
-        sensor_name = "filament_switch_sensor virtual_bypass"
-        vb_status = self.sensors.get(sensor_name, {}).get("filament_detected", False)
+        vb_status = self.read_bypass_state(self.sensors)
         logging.info(f"Virtual Bypass status: {vb_status}")
         self.virtual_bypass = vb_status  # Store the initial state
 
@@ -1039,10 +1071,23 @@ class Panel(ScreenPanel):
             self._screen._send_action(button, "printer.gcode.script",
                                       {"script": "SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE=0"})
 
+        # AFC refuses to enable the virtual bypass while a lane is loaded, so read
+        # the state back instead of leaving the button on an optimistic guess.
+        GLib.timeout_add(500, self.confirm_virtual_bypass)
+
+    def confirm_virtual_bypass(self):
+        """
+        One-shot re-read of the bypass state after a toggle.
+        """
+        self.request_sensor_state()
+        return False
+
     def update_virtual_bypass_toggle(self, new_status):
         """
         Update the Virtual Bypass toggle button if its state has changed.
         """
+        if bool(new_status) != bool(self.virtual_bypass):
+            logging.info(f"Virtual Bypass changed: {self.virtual_bypass} -> {bool(new_status)}")
         if hasattr(self, "virtual_bypass_button"):
             style = self.virtual_bypass_button.get_style_context()
             style.remove_class("vb_active")
@@ -2452,9 +2497,8 @@ class Panel(ScreenPanel):
         self.sensor_labels = {}
 
         screen_width = self._screen.width
-        # Fetch the current sensor states before passing to create_sensor_grid
-        sensor_data = self.fetch_sensor_data()
-        sensors_grid = self.create_sensor_grid(self.filament_sensors, screen_width, sensor_data)
+        # Dots start from the last query; request_sensor_state() refreshes them.
+        sensors_grid = self.create_sensor_grid(self.filament_sensors, screen_width, self.sensors)
         vbox.pack_start(sensors_grid, True, True, 0)
 
         refresh_button = Gtk.Button(label="Refresh")
@@ -2558,16 +2602,59 @@ class Panel(ScreenPanel):
 
         return overlay
 
-    def fetch_sensor_data(self):
+    def request_sensor_state(self):
         """
-        Reads the filament sensor states out of the printer data that KlipperScreen
-        already subscribes to.
-        :return: Dictionary containing the status of the sensors.
+        Query the filament sensor states plus the AFC bypass state. These objects
+        are registered at runtime, so KlipperScreen's global subscription does not
+        carry them and _printer has no data for them.
         """
-        return {
-            name: {"filament_detected": self._printer.get_stat(name, "filament_detected")}
-            for name in self.filament_sensors
+        if self.sensors_pending or not self.filament_sensors:
+            return
+        objects = {name: ["enabled", "filament_detected"] for name in self.filament_sensors}
+        objects["AFC"] = ["bypass_state"]
+        self.sensors_pending = True
+        if not self._screen._ws.send_method("printer.objects.query", {"objects": objects},
+                                            self.handle_sensor_state):
+            self.sensors_pending = False
+
+    def handle_sensor_state(self, response, method, params):
+        """
+        Apply a printer.objects.query reply to the sensor dots and the bypass toggle.
+        """
+        self.sensors_pending = False
+        if not self.update_info or not self.ready:
+            return
+        status = {}
+        if isinstance(response, dict):
+            status = response.get("result", {}).get("status", {}) or {}
+        if not status:
+            return
+
+        self.sensors = {
+            name: data for name, data in status.items()
+            if name.startswith("filament_switch_sensor")
         }
+        self.update_sensors(self.sensors)
+        self.update_virtual_bypass_toggle(self.read_bypass_state(status))
+
+    @staticmethod
+    def read_bypass_state(status):
+        """
+        Work out whether the bypass is active from a printer.objects.query status.
+
+        AFC only mirrors the virtual bypass into filament_detected when it
+        recomputes the state, so the sensor dot cannot be trusted for it. Prefer
+        AFC's own bypass_state, and fall back to whether the sensor is enabled,
+        which is what AFC checks for a virtual bypass.
+        """
+        afc_state = status.get("AFC", {})
+        if "bypass_state" in afc_state:
+            return bool(afc_state["bypass_state"])
+        bypass = status.get("filament_switch_sensor virtual_bypass")
+        if bypass is None:
+            bypass = status.get("filament_switch_sensor bypass", {})
+            return bool(bypass.get("filament_detected", False))
+        return bool(bypass.get("enabled", False))
 
     def update_sensors(self, data):
         """
@@ -2584,21 +2671,12 @@ class Panel(ScreenPanel):
                 style.remove_class("status-active")
                 style.add_class("status-active" if detected else "status-empty")
 
-        sensor_name = "filament_switch_sensor virtual_bypass"
-        vb_status = data.get(sensor_name, {}).get("filament_detected", False)
-        self.update_virtual_bypass_toggle(vb_status)
-
     def on_refresh_clicked(self, button):
         """
         Handles the refresh button click event to update the sensor states.
         :param button: The refresh button widget.
         """
-        if not self.filament_sensors:
-            return
-        # Fetch the latest sensor data
-        sensor_data = self.fetch_sensor_data()
-        # Update the sensor grid
-        self.update_sensors(sensor_data)
+        self.request_sensor_state()
 
     def log_lane_widget_sizes(self):
         """One-shot: log frame + all children sizes for each lane."""
