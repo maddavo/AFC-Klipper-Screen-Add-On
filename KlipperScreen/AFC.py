@@ -31,6 +31,10 @@ RESPONSE_SET = 1003
 RESPONSE_UNLOAD = 1004
 RESPONSE_UNSET = 1005
 
+# AFC's runtime-registered objects are not in KlipperScreen's subscription, so
+# the panel polls them while it is visible.
+SENSOR_POLL_SECONDS = 2
+
 SYSTEM_TYPE_ICONS = {
     "Box_Turtle": "box_turtle_colored_logo.svg",
     "'Box Turtle'": "box_turtle_colored_logo.svg",
@@ -256,6 +260,7 @@ class Panel(ScreenPanel):
         self.sensors = {}
         self.printer_status = {}  # Last raw query reply, including the AFC object
         self.sensors_pending = False
+        self.sensor_poll_id = None
 
         self.reset_ui()
         if not self.request_object_list(self.load_object_list):
@@ -340,6 +345,11 @@ class Panel(ScreenPanel):
         self.create_spool_layout()
 
         self.ready = True
+        # The panel is built from a websocket reply, which lands after
+        # attach_panel() already called show_all(), so every widget made here
+        # still has its visible flag unset. Show them now instead of leaving the
+        # user with an empty control row until they re-enter the panel.
+        self.content.show_all()
         self.screen_stack.set_visible_child_name("main_grid")
         self.enable_buttons(self._printer.state in ("ready", "paused"))
         self.request_sensor_state()
@@ -461,11 +471,43 @@ class Panel(ScreenPanel):
             # Replies that arrived while the panel was deactivated were dropped,
             # so refresh instead of showing a stale bypass state.
             self.request_sensor_state(force=True)
+        self.start_sensor_poll()
         self.enable_buttons(self._printer.state in ("ready", "paused"))
 
     def deactivate(self):
         self.update_info = False
+        self.stop_sensor_poll()
         self.enable_buttons(False)
+
+    def start_sensor_poll(self):
+        """
+        Poll the sensor and bypass state while the panel is on screen.
+
+        AFC registers virtual_bypass and its switches at runtime, so they are not
+        in KlipperScreen's subscription and no notify_status_update is sent when
+        they change. Without a poll the panel only catches up when some unrelated
+        subscribed object happens to change, which on an idle printer can be many
+        seconds after a toggle in Mainsail.
+        """
+        if self.sensor_poll_id is not None:
+            return
+        self.sensor_poll_id = GLib.timeout_add_seconds(SENSOR_POLL_SECONDS, self.poll_sensor_state)
+
+    def stop_sensor_poll(self):
+        """
+        Stop polling once the panel is hidden; nothing is there to update.
+        """
+        if self.sensor_poll_id is None:
+            return
+        GLib.source_remove(self.sensor_poll_id)
+        self.sensor_poll_id = None
+
+    def poll_sensor_state(self):
+        if not self.update_info:
+            self.sensor_poll_id = None
+            return False
+        self.request_sensor_state()
+        return True
 
     def process_system_data(self, system_data):
         extruders = {name: Extruder(**data) for name, data in system_data.get("extruders", {}).items()}
