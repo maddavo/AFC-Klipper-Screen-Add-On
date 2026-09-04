@@ -244,6 +244,7 @@ class Panel(ScreenPanel):
         self.selected_type = None
         self.selected_weight = 0
         self.virtual_bypass = False
+        self.virtual_bypass_requested = None  # Pending toggle, cleared by the read-back
         self.led_state = False  # Track the AFC LED state
 
         # AFC registers virtual_bypass and most of its lane/hub switches at
@@ -253,6 +254,7 @@ class Panel(ScreenPanel):
         # KlipperScreen only subscribes to the sensors it found in the config.
         self.filament_sensors = []
         self.sensors = {}
+        self.printer_status = {}  # Last raw query reply, including the AFC object
         self.sensors_pending = False
 
         self.reset_ui()
@@ -456,6 +458,9 @@ class Panel(ScreenPanel):
         self.update_info = True
         if self.ready:
             self.screen_stack.set_visible_child_name("main_grid")
+            # Replies that arrived while the panel was deactivated were dropped,
+            # so refresh instead of showing a stale bypass state.
+            self.request_sensor_state(force=True)
         self.enable_buttons(self._printer.state in ("ready", "paused"))
 
     def deactivate(self):
@@ -1009,8 +1014,8 @@ class Panel(ScreenPanel):
         This button allows the user to enable or disable the virtual bypass feature.
         """
 
-        vb_status = self.read_bypass_state(self.sensors)
-        logging.info(f"Virtual Bypass status: {vb_status}")
+        vb_status, vb_source = self.read_bypass_state(self.printer_status)
+        logging.info(f"Virtual Bypass status: {vb_status} (from {vb_source})")
         self.virtual_bypass = vb_status  # Store the initial state
 
         # Create the AFC Virtual Bypass button
@@ -1053,50 +1058,102 @@ class Panel(ScreenPanel):
         # Toggle the state
         new_state = not self.virtual_bypass
         self.virtual_bypass = new_state
+        # Remember what was asked for so the read-back can tell the user when the
+        # printer did not follow, instead of silently flipping the button back.
+        self.virtual_bypass_requested = new_state
 
-        # Update the button style
-        style = button.get_style_context()
-        style.remove_class("vb_active")
-        style.remove_class("vb_inactive")
-        if new_state:
-            style.add_class("vb_active")
-            logging.info("AFC Virtual Bypass enabled")
-            self._screen.show_popup_message(_("Virtual Bypass enabled"), 1)
-            self._screen._send_action(button, "printer.gcode.script",
-                                      {"script": "SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE=1"})
-        else:
-            style.add_class("vb_inactive")
-            logging.info("AFC Virtual Bypass disabled")
-            self._screen.show_popup_message(_("Virtual Bypass Disabled"), 1)
-            self._screen._send_action(button, "printer.gcode.script",
-                                      {"script": "SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE=0"})
+        self.set_virtual_bypass_style(new_state)
+
+        enable = "1" if new_state else "0"
+        logging.info(f"AFC Virtual Bypass toggled to {new_state}, sending ENABLE={enable}")
+        self._screen.show_popup_message(
+            _("Virtual Bypass enabled") if new_state else _("Virtual Bypass Disabled"), 1)
+        if not self._screen._ws.send_method(
+                "printer.gcode.script",
+                {"script": f"SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE={enable}"},
+                self.handle_virtual_bypass_reply):
+            logging.error("Virtual Bypass toggle not sent, websocket is not connected")
+            self._screen.show_popup_message(_("Virtual Bypass could not be set:\nnot connected"))
+            self.virtual_bypass_requested = None
+            return
 
         # AFC refuses to enable the virtual bypass while a lane is loaded, so read
-        # the state back instead of leaving the button on an optimistic guess.
+        # the state back instead of leaving the button on an optimistic guess. The
+        # first read can beat AFC recomputing its state, so check twice before
+        # deciding the request was rejected.
         GLib.timeout_add(500, self.confirm_virtual_bypass)
+        GLib.timeout_add(1500, self.confirm_virtual_bypass)
+        GLib.timeout_add(2500, self.finalize_virtual_bypass)
+
+    def handle_virtual_bypass_reply(self, response, method, params):
+        """
+        Surface a rejected SET_FILAMENT_SENSOR instead of letting the button lie.
+        """
+        error = response.get("error") if isinstance(response, dict) else None
+        if error:
+            message = error.get("message", error) if isinstance(error, dict) else error
+            logging.error(f"SET_FILAMENT_SENSOR virtual_bypass failed: {message}")
+            self._screen.show_popup_message(_("Virtual Bypass could not be set:\n{}").format(message))
+        self.request_sensor_state(force=True)
 
     def confirm_virtual_bypass(self):
         """
         One-shot re-read of the bypass state after a toggle.
         """
-        self.request_sensor_state()
+        self.request_sensor_state(force=True)
         return False
 
-    def update_virtual_bypass_toggle(self, new_status):
+    def finalize_virtual_bypass(self):
         """
-        Update the Virtual Bypass toggle button if its state has changed.
+        Last word on a toggle: if the printer never reached the requested state,
+        say so rather than leaving the user guessing why nothing happened.
         """
-        if bool(new_status) != bool(self.virtual_bypass):
-            logging.info(f"Virtual Bypass changed: {self.virtual_bypass} -> {bool(new_status)}")
-        if hasattr(self, "virtual_bypass_button"):
-            style = self.virtual_bypass_button.get_style_context()
-            style.remove_class("vb_active")
-            style.remove_class("vb_inactive")
-            if new_status:
-                style.add_class("vb_active")
+        requested = self.virtual_bypass_requested
+        self.virtual_bypass_requested = None
+        if requested is not None and bool(self.virtual_bypass) != requested:
+            logging.warning(f"Virtual Bypass request {requested} was not accepted, "
+                            f"printer reports {self.virtual_bypass}")
+            self._screen.show_popup_message(
+                _("Virtual Bypass could not be {}.\nCheck that no lane is loaded.").format(
+                    _("enabled") if requested else _("disabled")))
+        return False
+
+    def set_virtual_bypass_style(self, active):
+        """
+        Paint the Virtual Bypass button for the given state.
+        """
+        button = getattr(self, "virtual_bypass_button", None)
+        if button is None:
+            return
+        style = button.get_style_context()
+        style.remove_class("vb_active")
+        style.remove_class("vb_inactive")
+        style.add_class("vb_active" if active else "vb_inactive")
+
+    def update_virtual_bypass_toggle(self, new_status, source="unknown", status=None):
+        """
+        Update the Virtual Bypass toggle button to the state read from the printer.
+        """
+        new_status = bool(new_status)
+        if source == "unavailable":
+            # Nothing in the reply describes the bypass, so leave the button
+            # alone rather than forcing it to False on every poll.
+            logging.debug("Virtual Bypass state not present in printer status, keeping current state")
+            return
+
+        if new_status != bool(self.virtual_bypass):
+            logging.info(f"Virtual Bypass changed: {self.virtual_bypass} -> {new_status} (from {source})")
+
+        if self.virtual_bypass_requested is not None:
+            if self.virtual_bypass_requested == new_status:
+                # Request landed, stop watching for it.
+                self.virtual_bypass_requested = None
             else:
-                style.add_class("vb_inactive")
-            self.virtual_bypass = bool(new_status)
+                logging.info(f"Virtual Bypass still {new_status} after requesting "
+                             f"{self.virtual_bypass_requested} (from {source}, status={status})")
+
+        self.virtual_bypass = new_status
+        self.set_virtual_bypass_style(new_status)
 
     def show_lane_move_grid(self, button):
         """
@@ -2602,13 +2659,19 @@ class Panel(ScreenPanel):
 
         return overlay
 
-    def request_sensor_state(self):
+    def request_sensor_state(self, force=False):
         """
         Query the filament sensor states plus the AFC bypass state. These objects
         are registered at runtime, so KlipperScreen's global subscription does not
         carry them and _printer has no data for them.
+
+        :param force: Send even if a query is already in flight. Used after a
+                      toggle, where dropping the read-back would leave the button
+                      showing a state the printer never reached.
         """
-        if self.sensors_pending or not self.filament_sensors:
+        if not self.filament_sensors:
+            return
+        if self.sensors_pending and not force:
             return
         objects = {name: ["enabled", "filament_detected"] for name in self.filament_sensors}
         objects["AFC"] = ["bypass_state"]
@@ -2630,31 +2693,53 @@ class Panel(ScreenPanel):
         if not status:
             return
 
+        self.printer_status = status
         self.sensors = {
             name: data for name, data in status.items()
             if name.startswith("filament_switch_sensor")
         }
         self.update_sensors(self.sensors)
-        self.update_virtual_bypass_toggle(self.read_bypass_state(status))
+        bypass_state, source = self.read_bypass_state(status)
+        self.update_virtual_bypass_toggle(bypass_state, source, status)
 
     @staticmethod
     def read_bypass_state(status):
         """
         Work out whether the bypass is active from a printer.objects.query status.
 
-        AFC only mirrors the virtual bypass into filament_detected when it
-        recomputes the state, so the sensor dot cannot be trusted for it. Prefer
-        AFC's own bypass_state, and fall back to whether the sensor is enabled,
-        which is what AFC checks for a virtual bypass.
+        Returns (state, source) so callers can log where the answer came from.
+
+        Every field below is optional depending on the AFC and Klipper versions
+        installed, so each one is only used when the key is actually present. A
+        missing key must fall through rather than read as False, otherwise the
+        toggle sticks in one position and every press sends the same ENABLE
+        value.
+
+        Order of preference:
+          1. AFC's own bypass_state, which is what AFC itself acts on.
+          2. The virtual bypass sensor's enabled flag, which is the thing
+             SET_FILAMENT_SENSOR writes and what AFC reads back.
+          3. filament_detected, which AFC mirrors from enabled every time it
+             recomputes the state. Older Klipper releases do not report enabled
+             at all, so this is the only signal left there.
         """
-        afc_state = status.get("AFC", {})
+        afc_state = status.get("AFC") or {}
         if "bypass_state" in afc_state:
-            return bool(afc_state["bypass_state"])
+            return bool(afc_state["bypass_state"]), "AFC.bypass_state"
+
         bypass = status.get("filament_switch_sensor virtual_bypass")
-        if bypass is None:
-            bypass = status.get("filament_switch_sensor bypass", {})
-            return bool(bypass.get("filament_detected", False))
-        return bool(bypass.get("enabled", False))
+        if bypass is not None:
+            if "enabled" in bypass:
+                return bool(bypass["enabled"]), "virtual_bypass.enabled"
+            return bool(bypass.get("filament_detected", False)), "virtual_bypass.filament_detected"
+
+        # Hardware bypass: enabled only says the sensor is switched on, so the
+        # only meaningful signal is whether filament is actually present.
+        bypass = status.get("filament_switch_sensor bypass")
+        if bypass is not None:
+            return bool(bypass.get("filament_detected", False)), "bypass.filament_detected"
+
+        return False, "unavailable"
 
     def update_sensors(self, data):
         """
