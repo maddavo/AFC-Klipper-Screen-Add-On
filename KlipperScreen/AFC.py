@@ -1515,6 +1515,15 @@ class Panel(ScreenPanel):
                         lane.material = lane_data.get("material", lane.material)
                         self.update_lane_material(lane)
 
+                    new_spool_id = int(lane_data.get("spool_id", lane.spool_id) or 0)
+                    if lane.spool_id != new_spool_id:
+                        lane.spool_id = new_spool_id
+                        if self.selected_lane is lane and hasattr(self, "spoolman_model"):
+                            self.labels["spoolman_lane"].set_text(
+                                f'{lane.name} — {_("Spool ID")}: {lane.spool_id or _("None")}'
+                            )
+                            self.update_spoolman_buttons()
+
                     new_weight = round(float(lane_data.get("weight", lane.weight) or 0))
                     if lane.weight != new_weight:
                         lane.weight = new_weight

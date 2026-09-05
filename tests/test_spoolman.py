@@ -186,6 +186,39 @@ class SpoolmanTests(unittest.TestCase):
         script = panel._screen._send_action.call_args.args[2]["script"]
         self.assertEqual(script, "SET_MAP LANE=lane3 MAP=T0\nCHANGE_TOOL LANE=lane3")
 
+    def test_status_refresh_updates_cached_spool_id_and_clear(self):
+        panel = self.panel
+        panel.selected_lane = panel.afc_lane_data[0]
+        panel.labels["spoolman_lane"] = Gtk.Label()
+        panel.labels["spoolman_status"] = Gtk.Label()
+        panel.spoolman_model = Gtk.ListStore(int, str)
+        panel.spoolman_tree = Gtk.TreeView(model=panel.spoolman_model)
+        panel.buttons["spoolman_assign"] = Gtk.Button()
+        panel.buttons["spoolman_clear"] = Gtk.Button()
+        panel.buttons["spoolman_refresh"] = Gtk.Button()
+        panel.afc_units = [SimpleNamespace(name="HTLF_1", lanes=[panel.selected_lane])]
+        panel.afc_system = SimpleNamespace(current_load=None)
+        panel.led_state = False
+        panel.hub_states = {}
+        panel.update_afc_system = Mock()
+        panel.update_hub_status = Mock()
+        panel.get_lane_status_from_data = Mock(return_value=afc.UNLOADED)
+        panel.handle_lane_status_update = Mock()
+        panel.update_lane_map = Mock()
+        panel.update_lane_runout = Mock()
+        panel.update_lane_material = Mock()
+        panel.update_lane_weight = Mock()
+        panel.update_lane_color = Mock()
+        panel.update_lane_load = Mock()
+        panel.update_system_container = Mock()
+        panel.update_spoolman_buttons = Mock()
+        panel.update_ui({"system": {}, "HTLF_1": {"lane1": {"spool_id": 42}}})
+        self.assertEqual(panel.selected_lane.spool_id, 42)
+        self.assertIn("42", panel.labels["spoolman_lane"].get_text())
+        panel.update_ui({"system": {}, "HTLF_1": {"lane1": {"spool_id": None}}})
+        self.assertEqual(panel.selected_lane.spool_id, 0)
+        self.assertIn("None", panel.labels["spoolman_lane"].get_text())
+
 
 if __name__ == "__main__":
     unittest.main()
