@@ -189,6 +189,15 @@ class SpoolmanTests(unittest.TestCase):
     def test_status_refresh_updates_cached_spool_id_and_clear(self):
         panel = self.panel
         panel.selected_lane = panel.afc_lane_data[0]
+        panel.selected_lane.buffer = None
+        panel.selected_lane.buffer_status = None
+        panel.selected_lane.status = afc.UNLOADED
+        panel.selected_lane.map = "T0"
+        panel.selected_lane.runout_lane = None
+        panel.selected_lane.material = ""
+        panel.selected_lane.weight = 0
+        panel.selected_lane.color = ""
+        panel.selected_lane.load = False
         panel.labels["spoolman_lane"] = Gtk.Label()
         panel.labels["spoolman_status"] = Gtk.Label()
         panel.spoolman_model = Gtk.ListStore(int, str)
