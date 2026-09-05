@@ -858,7 +858,12 @@ class Panel(ScreenPanel):
         self._gtk.remove_dialog(dialog)
         lane = self.selected_lane
         if response_id == RESPONSE_LOAD:
-            self._screen._send_action(dialog, "printer.gcode.script", {"script": f"CHANGE_TOOL LANE={lane.name}"})
+            # SET_MAP swaps the selected lane with the lane currently mapped to
+            # T0, so the loaded lane remains the active T0 lane for temperature
+            # and purge macros.
+            self._screen._send_action(dialog, "printer.gcode.script", {
+                "script": f"SET_MAP LANE={lane.name} MAP=T0\nCHANGE_TOOL LANE={lane.name}"
+            })
         elif response_id == RESPONSE_UNLOAD:
             self._screen._send_action(dialog, "printer.gcode.script", {"script": "TOOL_UNLOAD"})
         elif response_id == RESPONSE_EJECT:
