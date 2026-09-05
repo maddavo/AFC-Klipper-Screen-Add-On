@@ -177,6 +177,15 @@ class SpoolmanTests(unittest.TestCase):
         self.assertEqual(self.panel.labels["type_input"].get_text(), "PLA")
         self.assertEqual(self.panel.labels["weight_input"].get_text(), "500")
 
+    def test_load_swaps_selected_lane_to_t0_before_change(self):
+        panel = self.panel
+        panel.selected_lane = SimpleNamespace(name="lane3")
+        panel._gtk.remove_dialog = Mock()
+        panel._screen._send_action = Mock()
+        panel.control_confirm(Mock(), afc.RESPONSE_LOAD)
+        script = panel._screen._send_action.call_args.args[2]["script"]
+        self.assertEqual(script, "SET_MAP LANE=lane3 MAP=T0\nCHANGE_TOOL LANE=lane3")
+
 
 if __name__ == "__main__":
     unittest.main()
