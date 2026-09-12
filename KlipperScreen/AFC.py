@@ -1662,7 +1662,8 @@ class Panel(ScreenPanel):
                     new_spool_id = int(lane_data.get("spool_id", lane.spool_id) or 0)
                     if lane.spool_id != new_spool_id:
                         lane.spool_id = new_spool_id
-                        if self.selected_lane is lane and hasattr(self, "spoolman_model"):
+                        if (self.selected_lane is lane
+                            and getattr(self, "spoolman_selector_ready", False)):
                             self.labels["spoolman_lane"].set_text(
                                 f'{lane.name} — {_("Spool ID")}: {lane.spool_id or _("None")}'
                             )
@@ -2281,7 +2282,10 @@ class Panel(ScreenPanel):
     ##################
 
     def show_spoolman_selector(self, lane):
-        if not hasattr(self, "spoolman_model"):
+        if not getattr(self, "spoolman_selector_ready", False):
+            old_page = self.screen_stack.get_child_by_name("spoolman_selector")
+            if old_page is not None:
+                self.screen_stack.remove(old_page)
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
             self.labels["spoolman_lane"] = Gtk.Label()
             box.pack_start(self.labels["spoolman_lane"], False, False, 0)
@@ -2311,6 +2315,7 @@ class Panel(ScreenPanel):
             box.pack_start(buttons, False, False, 0)
             self.screen_stack.add_named(box, "spoolman_selector")
             box.show_all()
+            self.spoolman_selector_ready = True
         self.selected_lane = lane
         self.labels["spoolman_lane"].set_text(
             f'{lane.name} — {_("Spool ID")}: {lane.spool_id or _("None")}'

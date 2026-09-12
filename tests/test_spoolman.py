@@ -228,6 +228,18 @@ class SpoolmanTests(unittest.TestCase):
         self.assertEqual(panel.selected_lane.spool_id, 0)
         self.assertIn("None", panel.labels["spoolman_lane"].get_text())
 
+    def test_partial_selector_state_is_rebuilt(self):
+        panel = self.panel
+        # Reproduce the Pi failure: a previous attempt left the list model but
+        # no corresponding header label or complete selector page.
+        panel.spoolman_model = Gtk.ListStore(int, str)
+        panel.spoolman_selector_ready = False
+        panel.labels.pop("spoolman_lane", None)
+        panel.show_spoolman_selector(panel.afc_lane_data[0])
+        self.assertTrue(panel.spoolman_selector_ready)
+        self.assertIn("spoolman_lane", panel.labels)
+        self.assertEqual(panel.screen_stack.get_visible_child_name(), "spoolman_selector")
+
 
 if __name__ == "__main__":
     unittest.main()
