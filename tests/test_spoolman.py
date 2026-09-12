@@ -51,6 +51,8 @@ class SpoolmanTests(unittest.TestCase):
         panel.spoolman_pending = False
         panel.status_pending = False
         panel.spoolman = "http://spoolman:7912"
+        panel.sensor_poll_id = None
+        panel.action_buttons = {}
         panel.afc_lane_data = [SimpleNamespace(name="lane1", spool_id=7),
                                SimpleNamespace(name="lane2", spool_id=8)]
         panel.show_selector_grid(None, panel.afc_lane_data[0])
