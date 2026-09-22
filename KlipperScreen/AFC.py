@@ -2317,7 +2317,13 @@ class Panel(ScreenPanel):
             box.show_all()
             self.spoolman_selector_ready = True
         self.selected_lane = lane
-        self.labels["spoolman_lane"].set_text(
+        spoolman_lane_label = self.labels.get("spoolman_lane")
+        if spoolman_lane_label is None:
+            # A reconnect or panel rebuild can leave the readiness flag from an
+            # earlier instance while the label dictionary belongs to a fresh one.
+            self.spoolman_selector_ready = False
+            return self.show_spoolman_selector(lane)
+        spoolman_lane_label.set_text(
             f'{lane.name} — {_("Spool ID")}: {lane.spool_id or _("None")}'
         )
         self._screen.remove_keyboard()

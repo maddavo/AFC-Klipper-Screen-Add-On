@@ -242,6 +242,14 @@ class SpoolmanTests(unittest.TestCase):
         self.assertIn("spoolman_lane", panel.labels)
         self.assertEqual(panel.screen_stack.get_visible_child_name(), "spoolman_selector")
 
+    def test_ready_flag_with_missing_label_is_rebuilt(self):
+        panel = self.panel
+        panel.spoolman_selector_ready = True
+        panel.labels.pop("spoolman_lane", None)
+        panel.show_spoolman_selector(panel.afc_lane_data[0])
+        self.assertIn("spoolman_lane", panel.labels)
+        self.assertEqual(panel.screen_stack.get_visible_child_name(), "spoolman_selector")
+
 
 if __name__ == "__main__":
     unittest.main()
