@@ -2294,8 +2294,12 @@ class Panel(ScreenPanel):
             renderer = Gtk.CellRendererText()
             renderer.set_property("wrap-mode", Pango.WrapMode.WORD_CHAR)
             renderer.set_property("wrap-width", max(150, self._screen.width - 80))
-            self.spoolman_tree.append_column(Gtk.TreeViewColumn(_("Spool"), renderer, text=1))
-            self.spoolman_tree.get_selection().connect("changed", self.update_spoolman_buttons)
+            spool_column = Gtk.TreeViewColumn(_("Spool"), renderer)
+            spool_column.set_cell_data_func(renderer, self._set_spoolman_cell)
+            self.spoolman_tree.append_column(spool_column)
+            selection = self.spoolman_tree.get_selection()
+            selection.set_mode(Gtk.SelectionMode.SINGLE)
+            selection.connect("changed", self.update_spoolman_buttons)
             scroll = self._gtk.ScrolledWindow()
             scroll.add(self.spoolman_tree)
             box.pack_start(scroll, True, True, 0)
@@ -2329,6 +2333,17 @@ class Panel(ScreenPanel):
         self._screen.remove_keyboard()
         self.screen_stack.set_visible_child_name("spoolman_selector")
         self.load_spoolman_spools()
+
+    def _set_spoolman_cell(self, column, cell, model, it, data):
+        """Render the picker row with an explicit, high-contrast selection."""
+        cell.set_property("text", model.get_value(it, 1))
+        selected = self.spoolman_tree.get_selection().path_is_selected(model.get_path(it))
+        if selected:
+            cell.set_property("cell-background-rgba", Gdk.RGBA(0.12, 0.42, 0.78, 1.0))
+            cell.set_property("foreground-rgba", Gdk.RGBA(1.0, 1.0, 1.0, 1.0))
+        else:
+            cell.set_property("cell-background-rgba", None)
+            cell.set_property("foreground-rgba", None)
 
     def update_spoolman_buttons(self, *args):
         if "spoolman_assign" not in self.buttons:
